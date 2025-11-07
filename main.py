@@ -5,6 +5,7 @@ NerdMiner-Style Solo BTC Lottery Miner + Dashboard
 - Wallet: bc1qxfd40euj7vsxvff2ens8l6ear52w3mu0rwts6a
 - Dashboard: http://0.0.0.0:8080
 - No disk logs, cross-platform
+- Pure threading (no multiprocessing)
 """
 
 import socket
@@ -12,11 +13,10 @@ import json
 import hashlib
 import time
 import threading
-import multiprocessing as mp
 import struct
-import os
 from binascii import unhexlify, hexlify
 from typing import Optional, Dict, Any, Set, Tuple
+import os
 import psutil
 
 # ===================== CONFIG =====================
@@ -33,7 +33,6 @@ STATS = {"total_hashes": 0, "shares_submitted": 0, "shares_accepted": 0, "num_wo
 STATS_LOCK = threading.Lock()
 NUM_WORKERS = 1
 GLOBAL_START = 0.0
-processes = []  # Defined at top to avoid issues
 
 def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -71,8 +70,9 @@ def build_block_header(
     )
     return header
 
-class MinerWorker:
+class MinerWorker(threading.Thread):
     def __init__(self, worker_id: int):
+        super().__init__(daemon=True)
         self.id = worker_id
         self.sock: Optional[socket.socket] = None
         self.extranonce1: bytes = b""
@@ -93,13 +93,13 @@ class MinerWorker:
             self.sock.settimeout(30)
             self.sock.connect((POOL_HOST, POOL_PORT))
             return True
-        except:
+        except Exception:
             return False
 
     def send(self, msg: dict):
         try:
             self.sock.sendall((json.dumps(msg) + "\n").encode())
-        except:
+        except Exception:
             pass
 
     def recv(self) -> Optional[dict]:
@@ -111,7 +111,7 @@ class MinerWorker:
                 self.recv_buffer += chunk
             line, self.recv_buffer = self.recv_buffer.split(b"\n", 1)
             return json.loads(line.decode())
-        except:
+        except Exception:
             return None
 
     def subscribe(self) -> bool:
@@ -164,6 +164,7 @@ class MinerWorker:
             return
         self.submitted_cache.add(key)
         if len(self.submitted_cache) > 10000:
+            # Keep only last 5000 to control memory
             self.submitted_cache = set(list(self.submitted_cache)[-5000:])
 
         params = [
@@ -266,7 +267,10 @@ class MinerWorker:
                 elif msg.get("id") == 2 and not msg.get("result"):
                     break
 
-            self.sock.close()
+            try:
+                self.sock.close()
+            except Exception:
+                pass
             log(f"Worker {self.id}: Reconnecting...")
 
 def monitor_stats():
@@ -277,12 +281,12 @@ def monitor_stats():
             continue
         with STATS_LOCK:
             total_hr = STATS["total_hashes"] / elapsed
-            STATS["num_workers"] = sum(1 for p in processes if p.is_alive())
+            STATS["num_workers"] = sum(1 for thr in threads if thr.is_alive())
             log(f"STATS: {total_hr/1000:.1f} KH/s | Shares: {STATS['shares_accepted']}/{STATS['shares_submitted']} | Workers: {STATS['num_workers']} | CPU: {psutil.cpu_percent()}%")
 
 def get_optimal_workers() -> int:
     global NUM_WORKERS
-    cores = mp.cpu_count()
+    cores = os.cpu_count() or 1
     workers = max(1, int(cores * 0.95))
     workers = min(workers, MAX_WORKERS)
     ram_gb = psutil.virtual_memory().total / (1024**3)
@@ -338,10 +342,7 @@ HTML_TEMPLATE = """
 
 if __name__ == "__main__":
     import platform
-    if platform.system() == "Windows":
-        mp.set_start_method('spawn', force=True)
-    else:
-        mp.set_start_method('fork', force=True)
+    # No multiprocessing used, so no start_method necessary
 
     GLOBAL_START = time.time()
     num_workers = get_optimal_workers()
@@ -388,21 +389,22 @@ if __name__ == "__main__":
     log(f"Dashboard: http://localhost:{DASHBOARD_PORT}")
 
     # === MINERS ===
-    global processes
-    processes = []
+    threads = []
     for i in range(1, num_workers + 1):
-        p = mp.Process(target=MinerWorker(i).run, daemon=True)
-        p.start()
-        processes.append(p)
+        thr = MinerWorker(i)
+        thr.start()
+        threads.append(thr)
         time.sleep(0.2)
 
     stat_thread = threading.Thread(target=monitor_stats, daemon=True)
     stat_thread.start()
 
     try:
-        for p in processes:
-            p.join()
+        while any(thr.is_alive() for thr in threads):
+            time.sleep(1)
     except KeyboardInterrupt:
         log("Shutting down...")
-        for p in processes:
-            p.terminate()
+        for thr in threads:
+            thr.stop_event.set()
+        for thr in threads:
+            thr.join(timeout=2)
