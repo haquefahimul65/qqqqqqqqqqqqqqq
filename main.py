@@ -18,6 +18,8 @@ from binascii import unhexlify, hexlify
 from typing import Optional, Dict, Any, Set, Tuple
 import os
 import psutil
+import uuid
+SERVER_ID = str(uuid.uuid4())[:6]
 
 # ===================== CONFIG =====================
 POOL_HOST = "public-pool.io"
@@ -127,7 +129,7 @@ class MinerWorker(threading.Thread):
         self.send({
             "id": 2,
             "method": "mining.authorize",
-            "params": [f"{BTC_WALLET}.{self.id}", ""]
+            "params": [f"{BTC_WALLET}.{SERVER_ID}-{self.id}", ""]
         })
         resp = self.recv()
         return resp and resp.get("result") is True
@@ -168,7 +170,7 @@ class MinerWorker(threading.Thread):
             self.submitted_cache = set(list(self.submitted_cache)[-5000:])
 
         params = [
-            f"{BTC_WALLET}.{self.id}",
+            f"{BTC_WALLET}.{SERVER_ID}-{self.id}",
             self.job["id"],
             hexlify(extranonce2).decode(),
             f"{ntime:08x}",
@@ -322,7 +324,7 @@ HTML_TEMPLATE = """
         <div class="stat"><div class="label">Uptime</div><div class="value" id="up">{{ uptime }}</div></div>
         <div class="stat"><div class="label">CPU %</div><div class="value" id="cpu">{{ cpu }}</div></div>
     </div>
-    <p><a href="https://web.public-pool.io" target="_blank" style="color:#0f0;">Pool Dashboard</a></p>
+    <p><a href="https://web.public-pool.io/#/app/{{ wallet }}" target="_blank" style="color:#0f0;">Your Pool Stats</a></p>
     <script>
         setInterval(() => {
             fetch('/api/stats').then(r => r.json()).then(d => {
