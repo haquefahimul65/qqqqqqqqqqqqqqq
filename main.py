@@ -202,13 +202,13 @@ class MinerWorker:
     def subscribe(self) -> bool:
         """Subscribe to mining"""
         self.send({"id": 1, "method": "mining.subscribe", "params": ["NerdMinerPy/1.0"]})
-        
+
         # Wait for subscribe response
         for _ in range(50):  # 5 second timeout
             if self.subscribed:
                 return True
             time.sleep(0.1)
-        
+
         log(f"Worker {self.id}: Subscribe timeout")
         return False
 
@@ -216,13 +216,13 @@ class MinerWorker:
         """Authorize with wallet address"""
         worker_name = f"{BTC_WALLET}.{WORKER_PREFIX}-{self.id}"
         self.send({"id": 2, "method": "mining.authorize", "params": [worker_name, "x"]})
-        
+
         # Wait for authorization
         for _ in range(50):  # 5 second timeout
             if self.authorized:
                 return True
             time.sleep(0.1)
-        
+
         log(f"Worker {self.id}: Authorization timeout")
         return False
 
@@ -230,7 +230,7 @@ class MinerWorker:
         """Handle new job from pool"""
         try:
             job_id, prevhash, cb1, cb2, branches, version, nbits, ntime, clean = params
-            
+
             new_job = {
                 "id": job_id,
                 "prevhash": prevhash,
@@ -296,7 +296,7 @@ class MinerWorker:
 
         self.msg_id += 1
         self.send({"id": self.msg_id, "method": "mining.submit", "params": params})
-        
+
         with STATS_LOCK:
             STATS["shares_submitted"] += 1
 
@@ -311,7 +311,7 @@ class MinerWorker:
         # Calculate this worker's nonce range
         nonce_start = (self.id - 1) * (0x100000000 // self.num_workers)
         nonce_end = self.id * (0x100000000 // self.num_workers)
-        
+
         # Calculate extranonce2 range
         max_extranonce2 = 1 << (8 * self.extranonce2_size)
         extranonce2_stride = max(1, max_extranonce2 // self.num_workers)
@@ -392,19 +392,36 @@ class MinerWorker:
                 continue
             backoff = 1
 
+            # Start receiver thread before subscribing
+            self.receiver_thread = threading.Thread(target=self.receiver_loop, daemon=True)
+            self.receiver_thread.start()
+            time.sleep(0.2)  # Brief pause to allow receiver to initialize
+
             # Subscribe
             if not self.subscribe():
-                self.sock.close()
+                # Cleanup on failure
+                self.shutdown.set()
+                if self.receiver_thread and self.receiver_thread.is_alive():
+                    self.receiver_thread.join(timeout=2.0)
+                self.shutdown.clear()
+                try:
+                    self.sock.close()
+                except:
+                    pass
                 time.sleep(2)
                 continue
 
-            # Start receiver thread
-            self.receiver_thread = threading.Thread(target=self.receiver_loop, daemon=True)
-            self.receiver_thread.start()
-
             # Authorize
             if not self.authorize():
-                self.sock.close()
+                # Cleanup on failure
+                self.shutdown.set()
+                if self.receiver_thread and self.receiver_thread.is_alive():
+                    self.receiver_thread.join(timeout=2.0)
+                self.shutdown.clear()
+                try:
+                    self.sock.close()
+                except:
+                    pass
                 time.sleep(2)
                 continue
 
@@ -416,11 +433,15 @@ class MinerWorker:
                 time.sleep(1)
 
             # Cleanup
+            self.shutdown.set()
+            if self.receiver_thread and self.receiver_thread.is_alive():
+                self.receiver_thread.join(timeout=2.0)
+            self.shutdown.clear()
             try:
                 self.sock.close()
             except:
                 pass
-            
+
             if not self.shutdown.is_set():
                 log(f"Worker {self.id}: Reconnecting...")
                 time.sleep(3)
@@ -432,16 +453,16 @@ def monitor_stats():
         elapsed = time.time() - GLOBAL_START
         if elapsed < 1:
             continue
-        
+
         with STATS_LOCK:
             avg_hr = STATS["total_hashes"] / elapsed / 1000
             curr_hr = STATS["current_hashrate"] / 1000
             workers = sum(
-                1 for t in worker_threads 
+                1 for t in worker_threads
                 if hasattr(t, "worker") and getattr(t, "worker", None) and t.worker.is_alive
             )
             STATS["num_workers"] = workers
-            
+
             log(
                 f"STATS: {curr_hr:.1f} KH/s (avg {avg_hr:.1f}) | "
                 f"Shares: {STATS['shares_accepted']}/{STATS['shares_submitted']} | "
@@ -453,14 +474,14 @@ def get_optimal_workers() -> int:
     try:
         cores = psutil.cpu_count(logical=True) or 4
         ram_gb = psutil.virtual_memory().total / (1024**3)
-        
+
         # Use 75% of cores for mining
         workers = max(1, int(cores * 0.75))
-        
+
         # Limit by RAM (1 worker per 0.5GB)
         max_by_ram = max(1, int(ram_gb * 2))
         workers = min(workers, max_by_ram)
-        
+
         log(f"Using {workers} workers on {cores} cores, {ram_gb:.1f} GB RAM")
         return workers
     except:
@@ -519,7 +540,7 @@ if __name__ == "__main__":
 
     # === DASHBOARD ===
     from flask import Flask, render_template_string, jsonify
-    
+
     app = Flask(__name__)
     app.logger.disabled = True
 
@@ -570,7 +591,7 @@ if __name__ == "__main__":
         t.worker = worker
         t.start()
         worker_threads.append(t)
-        time.sleep(0.3)
+        time.sleep(1.0)  # ← Stagger worker startup by 1 second
 
     stat_thread = threading.Thread(target=monitor_stats, daemon=True)
     stat_thread.start()
